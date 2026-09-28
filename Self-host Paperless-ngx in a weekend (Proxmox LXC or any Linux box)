@@ -1,4 +1,4 @@
-# Guide 004 — Self-host Paperless-ngx in a weekend (Proxmox LXC or any Linux box)
+# Guide 004 — Self-host Paperless-ngx in a weekend Proxmox LXC or any Linux box
 
 **Goal:** Paperless-ngx ingesting, OCR-ing, and tagging documents automatically, reachable over HTTPS through your existing reverse proxy.
 
