@@ -8,7 +8,7 @@
 | Host | Address | Role |
 |---|---|---|
 | `paperless01.lab.internal` | `192.0.2.60` | Paperless-ngx (Docker Compose stack: app + Redis + Postgres) |
-| `haproxy01.lab.internal` | `192.0.2.50` | TLS terminator, routes `paperless.lab.internal` → `:8000` *(optional but recommended)* |
+| `haproxy01.lab.internal` | `192.0.2.50` | TLS terminator, routes `paperless.lab.internal` → `192.0.2.60:8000` *(optional but recommended)* |
 
 Replace `lab.internal` and the 192.0.2.x IPs with your own network — every command below otherwise runs. No reverse proxy? Just browse `http://<host-ip>:8000` and skip step 6.
 
