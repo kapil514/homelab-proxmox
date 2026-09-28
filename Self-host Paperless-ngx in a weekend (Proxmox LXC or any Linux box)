@@ -1,0 +1,159 @@
+# Guide 004 — Self-host Paperless-ngx in a weekend (Proxmox LXC or any Linux box)
+
+**Goal:** Paperless-ngx ingesting, OCR-ing, and tagging documents automatically, reachable over HTTPS through your existing reverse proxy.
+
+
+## Architecture
+
+| Host | Address | Role |
+|---|---|---|
+| `paperless01.lab.internal` | `192.0.2.60` | Paperless-ngx (Docker Compose stack: app + Redis + Postgres) |
+| `haproxy01.lab.internal` | `192.0.2.50` | TLS terminator, routes `paperless.lab.internal` → `:8000` *(optional but recommended)* |
+
+Replace `lab.internal` and the 192.0.2.x IPs with your own network — every command below otherwise runs. No reverse proxy? Just browse `http://<host-ip>:8000` and skip step 6.
+
+## Prerequisites
+
+- **One of:**
+  - Proxmox host with an Ubuntu 24.04 / Debian 12 / Rocky 10 LXC template cached, or
+  - Any always-on Linux machine (bare metal, VM, Raspberry Pi 4+ works but OCR is slow there)
+- 2 vCPU, 4 GiB RAM, 20+ GiB disk for the app plus storage for your document archive
+- Docker + Docker Compose plugin
+- *(optional)* A DNS entry you control pointing `paperless.example` at your reverse proxy
+
+## Steps
+
+### 1. Prepare the host
+
+**Proxmox path:** create an unprivileged LXC, 2 vCPU / 4 GiB / 32 GiB, static IP `192.0.2.60`. This time you **do** need **nesting enabled** (Options → Features → Nesting) because we'll run Docker inside it.
+
+**Standalone path:** any fresh Linux install works — just make sure it has a static IP.
+
+Then on the machine:
+
+```bash
+hostnamectl set-hostname paperless01.lab.internal
+
+# Debian/Ubuntu
+curl -fsSL https://get.docker.com | sh
+docker version && docker compose version
+
+# Rocky/RHEL
+dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+systemctl enable --now docker
+```
+
+### 2. Lay down the directory structure
+
+```bash
+sudo mkdir -p /opt/paperless/{consume,data,media,export}
+cd /opt/paperless
+```
+
+- `consume/` — inbox. Anything dropped here gets imported automatically.
+- `media/` — **the archive original + OCR'd copies live here. Back this up.**
+- `data/` — search index, thumbnails, classification cache.
+- `export/` — where the built-in exporter dumps a portable copy.
+
+### 3. Grab the official Compose stack
+
+```bash
+curl -fsSL -o docker-compose.yml \
+  https://raw.githubusercontent.com/paperless-ngx/paperless-ngx/main/docker/compose/docker-compose.postgres.yml
+curl -fsSL -o docker-compose.env \
+  https://raw.githubusercontent.com/paperless-ngx/paperless-ngx/main/docker/compose/docker-compose.env
+```
+
+That compose file runs three services on an internal bridge network: `webserver` (Django app), `broker` (Redis), `db` (Postgres).
+
+Edit `docker-compose.yml`:
+
+```yaml
+webserver:
+  ports:
+    - "192.0.2.60:8000:8000"   # bind to the LAN IP, not 0.0.0.0
+  volumes:
+    - /opt/paperless/data:/usr/src/paperless/data
+    - /opt/paperless/media:/usr/src/paperless/media
+    - /opt/paperless/consume:/usr/src/paperless/consume
+    - /opt/paperless/export:/usr/src/paperless/export
+```
+
+And set these in `docker-compose.env`:
+
+```ini
+USERMAP_UID=1000            # a UID that owns the NFS/host storage, if any
+USERMAP_GID=1000
+PAPERLESS_URL=https://paperless.lab.internal   # omit if not using a proxy
+PAPERLESS_SECRET_KEY=***generate: openssl rand -base64 32***
+PAPERLESS_TIME_ZONE=Asia/Kolkata         # change to yours
+PAPERLESS_OCR_LANGUAGE=eng               # add yours: e.g. hin+eng, fra+eng
+PAPERLESS_ADMIN_USER=admin
+PAPERLESS_ADMIN_PASSWORD=***redacted-and-then-change-in-UI***
+```
+
+### 4. First start + login check
+
+```bash
+cd /opt/paperless
+docker compose pull
+docker compose up -d
+docker compose ps            # all three services "running"
+```
+
+Open `http://192.0.2.60:8000` (or your proxy URL) and log in with the admin credentials from the env file.
+
+### 5. Feed it something and watch the magic
+
+```bash
+cp ~/Downloads/any-bank-statement.pdf /opt/paperless/consume/
+docker compose logs -f webserver | grep -i consume
+```
+
+Within ~30 seconds you should see the document appear in the UI, OCR'd, with an auto-detected date and correspondent. Now configure the fun part in **Settings → Workflows**:
+
+- Trigger: *document contains* `invoice` → Actions: add tag `Invoice`, set correspondent
+- Trigger: *filename contains* `manual` → Actions: assign document type `Manual`, move to storage path `manuals/{correspondent}/{title}`
+
+This is where Paperless stops being a scanner app and becomes a system: new documents file themselves.
+
+### 6. (Optional) Put it behind HAProxy
+
+If you followed the lab's HAProxy pattern, the backend is a one-liner — Paperless exposes the login page as a ready-made health check:
+
+```haproxy
+backend paperless_backend
+    option httpchk GET /accounts/login/
+    server paperless01 192.0.2.60:8000 check
+```
+
+Set `PAPERLESS_URL=https://paperless.lab.internal`, restart the stack (`docker compose up -d`), and force the connection to upgrade for the live task view. On HAProxy 2.x+, WebSocket upgrade works automatically as long as the `option http-use-htx` default is intact — just raise the tunnel timeout above the default 10s so long OCR tasks don't drop.
+
+## Verification
+
+```bash
+# on paperless01
+docker compose -f /opt/paperless/docker-compose.yml ps
+# EXPECTED: broker, db, webserver all "running"
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/accounts/login/
+# EXPECTED: 200
+
+# from any client, behind the proxy
+curl --cacert ca.crt -I https://paperless.lab.internal/accounts/login/
+# EXPECTED: HTTP/2 200
+
+# end-to-end: ingest actually works
+cp sample.pdf /opt/paperless/consume/ && sleep 30
+ls /opt/paperless/media/documents/archive/   # EXPECTED: an OCR'd PDF appears
+```
+
+## Common failures I hit
+
+1. **Documents import then disappear / write errors in logs.** `consume/` or `media/` is on NFS or a bind mount whose UID doesn't match the container's. Fix `USERMAP_UID`/`USERMAP_GID` to match the storage side, `docker compose down && up -d`. While you're there: NFS-mounted *consume* folders don't fire inotify — set `PAPERLESS_CONSUMER_POLLING=60` or imports wait forever.
+2. **OCR output is garbage for non-English scans.** Tesseract only packs English by default. Set `PAPERLESS_OCR_LANGUAGE=hin+eng` (or your languages), recreate the container, then re-OCR existing docs: `docker compose exec webserver document_archiver` / re-run OCR from the UI bulk action. Mixed Hindi-English documents genuinely need `hin+eng`, not just `hin` — the English half keeps dates, amounts, and printed bank letterheads accurate.
+3. **UI loads but progress bars spin forever; "WebSocket error" in browser console.** The reverse proxy isn't upgrading the connection. On nginx you need the `Upgrade`/`Connection` headers; on HAProxy it's the tunnel timeout. Without it Paperless mostly works but the task dashboard lies to you.
+4. **`CSRF verification failed` right after adding HTTPS.** `PAPERLESS_URL` (or missing `X-Forwarded-Proto` from your proxy) doesn't match the scheme you're browsing. Fix one side, not both.
+5. **Import works but the OCR'd PDF looks different from the original.** That's expected — Paperless can overwrite the original with the OCR'd ("archive") version depending on config. The original is preserved in `media/documents/originals/`. Don't delete the archive; `export/` + `document_exporter` is your backup story.
+
+The pattern from every guide in this series applies here too: verify in isolation — `docker compose ps` → `curl localhost:8000` → proxy route → consume a test PDF — before declaring it broken.
